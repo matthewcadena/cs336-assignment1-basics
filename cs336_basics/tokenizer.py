@@ -56,14 +56,15 @@ def _update_byte_frequencies(
         new_bytes = tuple(new_bytes)
         updated_frequencies[new_bytes] = freq
     
-    return updated_frequencies    
+    return updated_frequencies   
 
-
-def train_bpe(
-    input_path,
-    vocab_size,
-    special_tokens: list[str]=['<|endoftext|>']
-):
+def _create_initial_vocab(
+    special_tokens: list[str]
+) -> tuple[dict[int, bytes], int]:
+    """Given a list of special tokens, create an initial mapping from vocab
+    indices to byte sequences for each special tokens. Returns the dictionary
+    itself and the number of initial entries.
+    """
     num_special_tokens = len(special_tokens)
     vocab = {}
     vocab = { 
@@ -74,46 +75,72 @@ def train_bpe(
     for i, special_token in enumerate[str](special_tokens):
         vocab[i] = special_token.encode('utf-8')
 
-    initial_vocab_size = len(vocab)
+    return vocab, len(vocab)
+
+
+def _create_byte_frequencies(
+    corpus: str,
+    regex_pattern: str,
+    special_tokens: list[str],
+) -> dict[tuple[bytes], int]:
+    """Given a raw corpus and a list of special tokens, splits the corpus by the special tokens
+    and a regex pattern, then constructs a mapping from tuples of bytes in the corpus to the 
+    frequency at which they appear.
+    """
+    corpus_split_on_special_characters = re.split(
+        ('|'.join([re.escape(st) for st in special_tokens])),
+        corpus,
+    )
     
+    pre_tokenized_segments: list[re.Scanner] = [
+        re.finditer(regex_pattern, segment) 
+        for segment in corpus_split_on_special_characters
+    ]
+
+    word_frequencies_per_segment: list[dict, [str, int]] = []
+    for segment in pre_tokenized_segments:
+        segment_word_frequencies = {}
+        for word in segment:
+            word_text = word.group()
+            segment_word_frequencies[word_text] = segment_word_frequencies.get(word_text, 0) + 1
+        word_frequencies_per_segment.append(segment_word_frequencies)
+
+    sorted_word_frequencies_per_segment = [
+        sorted(wft.items()) for wft in 
+        word_frequencies_per_segment
+    ]
+
+    merged_word_frequency_groups = list[tuple[str, int]](merge(
+        *sorted_word_frequencies_per_segment,
+        key=lambda pair: pair[0]
+    ))
+
+    word_frequencies: dict[str, int] = {}
+    for word, group in groupby(merged_word_frequency_groups, key=lambda pair: pair[0]):
+        word_frequencies[word] = sum([freq for _, freq in group])
+    
+    byte_frequencies: dict[tuple[bytes], int] = {
+        tuple([bytes([b]) for b in word.encode('utf-8')]): word_frequencies[word]
+        for word in word_frequencies
+    }
+
+    return byte_frequencies
+
+
+def train_bpe(
+    input_path,
+    vocab_size,
+    special_tokens: list[str]=['<|endoftext|>']
+):
+    vocab, initial_vocab_size = _create_initial_vocab(special_tokens)
     with open(input_path, "r", encoding="utf-8") as file:
         corpus = file.read()
-        corpus_split_on_special_characters = re.split(
-            ('|'.join([re.escape(st) for st in special_tokens])),
-            corpus,
+
+        byte_frequencies: dict[tuple[bytes], int] = _create_byte_frequencies(
+            corpus=corpus,
+            regex_pattern=PAT,
+            special_tokens=special_tokens,
         )
-        
-        pre_tokenized_segments = [
-            re.finditer(PAT, segment) 
-            for segment in corpus_split_on_special_characters
-        ]
-
-        word_frequencies_per_segment = []
-        for segment in pre_tokenized_segments:
-            segment_word_frequencies = {}
-            for word in segment:
-                word_text = word.group()
-                segment_word_frequencies[word_text] = segment_word_frequencies.get(word_text, 0) + 1    
-            word_frequencies_per_segment.append(segment_word_frequencies)
-
-        sorted_word_frequencies_per_segment = [
-            sorted(ft.items()) for ft in 
-            word_frequencies_per_segment
-        ]
-
-        merged_word_frequency_groups = list(merge(
-            *sorted_word_frequencies_per_segment,
-            key=lambda pair: pair[0]
-        ))
-
-        word_frequencies = {}
-        for word, group in groupby(merged_word_frequency_groups, key=lambda pair: pair[0]):
-            word_frequencies[word] = sum([freq for _, freq in group])
-        
-        byte_frequencies: [dict[tuple[bytes], int]] = {
-            tuple([bytes([b]) for b in word.encode('utf-8')]): word_frequencies[word]
-            for word in word_frequencies
-        }
 
         merges = []
         num_merges = len(merges)
