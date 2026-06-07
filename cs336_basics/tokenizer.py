@@ -3,12 +3,7 @@ from heapq import merge
 from itertools import groupby
 import regex as re
 
-from tests.common import gpt2_bytes_to_unicode
-
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-
-
-example_corpus = '''low low low low low lower lower widest widest widest newest newest newest newest newest newest'''
 
 def _get_most_frequent_pair(
     byte_frequencies: dict[tuple[bytes], int]
