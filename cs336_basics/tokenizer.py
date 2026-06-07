@@ -1,7 +1,6 @@
-import enum
-from heapq import merge
-from itertools import groupby
+from typing import Counter
 import regex as re
+from tqdm import tqdm
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -92,31 +91,27 @@ def _create_byte_frequencies(
         for segment in corpus_split_on_special_characters
     ]
 
-    word_frequencies_per_segment: list[dict, [str, int]] = []
-    for segment in pre_tokenized_segments:
-        segment_word_frequencies = {}
-        for word in segment:
-            word_text = word.group()
-            segment_word_frequencies[word_text] = segment_word_frequencies.get(word_text, 0) + 1
-        word_frequencies_per_segment.append(segment_word_frequencies)
-
-    sorted_word_frequencies_per_segment = [
-        sorted(wft.items()) for wft in 
-        word_frequencies_per_segment
+    word_segments = [
+        [
+            word.group() for word in segment
+        ]
+        for segment in tqdm(pre_tokenized_segments, desc="Per-segment word extraction")
+    ]
+    word_frequencies_per_segment = [
+        Counter(segment)
+        for segment in tqdm(word_segments, desc="Per-segment word frequency construction")
     ]
 
-    merged_word_frequency_groups = list[tuple[str, int]](merge(
-        *sorted_word_frequencies_per_segment,
-        key=lambda pair: pair[0]
-    ))
-
-    word_frequencies: dict[str, int] = {}
-    for word, group in groupby(merged_word_frequency_groups, key=lambda pair: pair[0]):
-        word_frequencies[word] = sum([freq for _, freq in group])
+    word_frequencies = Counter()
+    for word_frequency_table in tqdm(
+        word_frequencies_per_segment,
+        desc="Word frequency accumulation across segments"
+    ):
+        word_frequencies.update(word_frequency_table)
     
     byte_frequencies: dict[tuple[bytes], int] = {
         tuple([bytes([b]) for b in word.encode('utf-8')]): word_frequencies[word]
-        for word in word_frequencies
+        for word in tqdm(word_frequencies, desc="Byte frequency construction")
     }
 
     return byte_frequencies
@@ -140,6 +135,8 @@ def train_bpe(
         merges = []
         num_merges = len(merges)
 
+        progress_bar = tqdm(total=vocab_size, desc=f"Merges (out of expected {vocab_size})")
+
         while True:
             most_frequent_pair = _get_most_frequent_pair(byte_frequencies)
             if len(most_frequent_pair) == 0:
@@ -158,4 +155,9 @@ def train_bpe(
             )
             if len(vocab) == vocab_size:
                 break
+
+            progress_bar.update()
+        
+        progress_bar.close()
+
         return (vocab, merges)

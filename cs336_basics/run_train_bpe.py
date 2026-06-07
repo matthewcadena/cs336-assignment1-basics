@@ -48,11 +48,9 @@ def run_train_bpe(
 
 if __name__ == "__main__":
     run_train_bpe(
-        input_path="./data/TinyStoriesV2-GPT4-valid.txt",
+        input_path="./data/TinyStoriesV2-GPT4-train.txt",
         vocab_size=10_000,
         special_tokens=['<|endoftext|>'],
+        vocab_output_path='train_bpe_tiny_stories_train_vocab.json',
+        merges_output_path='train_bpe_tiny_stories_train_merges.txt',
     )
-
-
-        
-    
