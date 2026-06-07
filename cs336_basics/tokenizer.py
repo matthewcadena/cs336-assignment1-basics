@@ -126,7 +126,7 @@ def train_bpe(
     input_path,
     vocab_size,
     special_tokens: list[str]=['<|endoftext|>']
-):
+) -> tuple[dict[int, bytes], list[tuple[tuple[bytes]]]]:
     vocab, initial_vocab_size = _create_initial_vocab(special_tokens)
     with open(input_path, "r", encoding="utf-8") as file:
         corpus = file.read()
