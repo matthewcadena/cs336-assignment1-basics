@@ -1,6 +1,10 @@
-from typing import Counter
+from concurrent.futures import ProcessPoolExecutor
+from typing import BinaryIO, Counter
 import regex as re
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+
+from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -71,40 +75,79 @@ def _create_initial_vocab(
 
     return vocab, len(vocab)
 
-
-def _create_byte_frequencies(
-    corpus: str,
+def _get_chunk_word_frequencies(
+    file_chunk: str,
     regex_pattern: str,
     special_tokens: list[str],
+) -> Counter[str]:
+    """Given a file chunk, a regex pattern, and list of special tokens for splitting,
+    complete the pre-tokenization word-frequency table construction for the chunk.
+    Call this on separate chunks of a file using dedicated processes to do pre-
+    tokenization in parallel
+    """
+    file_chunk_split_on_special_characters = re.split(
+        ('|'.join([re.escape(st) for st in special_tokens])),
+        file_chunk,
+    )
+    
+    pre_tokenized_segments: list[re.Scanner] = [
+        re.finditer(regex_pattern, segment) 
+        for segment in file_chunk_split_on_special_characters
+    ]
+
+    word_frequencies_per_segment = [
+        Counter([word.group() for word in segment])
+        for segment in tqdm(
+            pre_tokenized_segments, desc="Intra-chunk per-segment word frequency construction")
+    ]
+    return word_frequencies_per_segment
+
+
+def _create_byte_frequencies(
+    file: BinaryIO,
+    regex_pattern: str,
+    special_tokens: list[str],
+    num_processes: int,
 ) -> dict[tuple[bytes], int]:
     """Given a raw corpus and a list of special tokens, splits the corpus by the special tokens
     and a regex pattern, then constructs a mapping from tuples of bytes in the corpus to the 
     frequency at which they appear.
     """
-    corpus_split_on_special_characters = re.split(
-        ('|'.join([re.escape(st) for st in special_tokens])),
-        corpus,
-    )
-    
-    pre_tokenized_segments: list[re.Scanner] = [
-        re.finditer(regex_pattern, segment) 
-        for segment in corpus_split_on_special_characters
-    ]
+    boundaries = find_chunk_boundaries(file, num_processes, special_tokens[0].encode('utf-8'))
 
-    word_segments = [
-        [
-            word.group() for word in segment
-        ]
-        for segment in tqdm(pre_tokenized_segments, desc="Per-segment word extraction")
-    ]
-    word_frequencies_per_segment = [
-        Counter(segment)
-        for segment in tqdm(word_segments, desc="Per-segment word frequency construction")
+    start_end_pairs = zip(boundaries[:-1], boundaries[1:])
+
+    file_chunks = []
+    for start, end in start_end_pairs:
+        file.seek(start)
+        chunk = file.read(end - start).decode("utf-8", errors="ignore")
+        file_chunks.append(chunk)
+
+    num_chunks = len(file_chunks)
+    chunk_regex_patterns = [regex_pattern] * num_chunks
+    chunk_special_tokens = [special_tokens] * num_chunks
+
+    # Pre-tokenize (obtain word counts) each chunk in parallel
+    with ProcessPoolExecutor(num_processes) as executor:
+        word_frequencies_per_segment_per_chunk = list(
+            executor.map(
+                _get_chunk_word_frequencies,
+                file_chunks,
+                chunk_regex_patterns,
+                chunk_special_tokens,
+            )
+        )
+
+    # Each chunk is still be broken up into segments, need to flatten
+    word_frequencies_per_chunk = [
+        word_frequencies
+        for segment in word_frequencies_per_segment_per_chunk
+        for word_frequencies in segment
     ]
 
     word_frequencies = Counter()
     for word_frequency_table in tqdm(
-        word_frequencies_per_segment,
+        word_frequencies_per_chunk,
         desc="Word frequency accumulation across segments"
     ):
         word_frequencies.update(word_frequency_table)
@@ -123,13 +166,13 @@ def train_bpe(
     special_tokens: list[str]=['<|endoftext|>']
 ) -> tuple[dict[int, bytes], list[tuple[tuple[bytes]]]]:
     vocab, initial_vocab_size = _create_initial_vocab(special_tokens)
-    with open(input_path, "r", encoding="utf-8") as file:
-        corpus = file.read()
+    with open(input_path, "rb") as file:
 
         byte_frequencies: dict[tuple[bytes], int] = _create_byte_frequencies(
-            corpus=corpus,
+            file=file,
             regex_pattern=PAT,
             special_tokens=special_tokens,
+            num_processes=cpu_count(),
         )
 
         merges = []
