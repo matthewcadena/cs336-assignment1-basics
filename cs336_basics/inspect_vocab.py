@@ -1,7 +1,7 @@
 import json
 
 def log_vocab_details(num_tokens: int):
-    with open('./train_bpe_tiny_stories_train_vocab.json', 'r') as v:
+    with open('./train_bpe_open_web_train_vocab.json', 'r') as v:
         vocab = json.load(v)
         
         longest_tokens = sorted(
@@ -17,4 +17,4 @@ def log_vocab_details(num_tokens: int):
     return
 
 if __name__ == "__main__":
-    log_vocab_details(10)
+    log_vocab_details(30)

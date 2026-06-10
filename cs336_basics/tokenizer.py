@@ -1,60 +1,168 @@
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
-from typing import BinaryIO, Counter
+from heapq import heappop, heappush
+import itertools
+from typing import Counter
 import regex as re
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+NUM_PROCESSES = cpu_count()
+NUM_CORPUS_CHUNKS = 98
 
-def _get_most_frequent_pair(
-    byte_frequencies: dict[tuple[bytes], int]
-) -> tuple[tuple[bytes]]:
-    pairs = {}
-    for bytes, freq in byte_frequencies.items():
-        byte_list = list(bytes)
-        for i in range(len(byte_list)-1):
-            pair = (bytes[i], bytes[i+1])
-            pairs[pair] = pairs.get(pair, 0) + freq
+class UpdateHeap:
+    def __init__(self, input_list: list):
+        self.pq = []
+        self.entry_finder = {}
+        self.REMOVED = '<removed-pair>'
+        self.counter = itertools.count()
+
+        for pair, priority in input_list:
+            self.add_pair(pair, priority)
+        
+
+    def add_pair(self, pair, priority=0):
+        'Add a new pair or update the priority of an existing pair'
+        if pair in self.entry_finder:
+            self.remove_pair(pair)
+        count = next(self.counter)
+        sentinel_value = 1 # will always cause a min-heap loss since all negated bytes <= 0
+        tiebreaker = (
+            tuple([-b for b in pair[0]] + [sentinel_value]),
+            tuple([-b for b in pair[1]] + [sentinel_value])
+        ) # lexicographically break ties
+        entry = [(-priority, tiebreaker), count, pair]
+        self.entry_finder[pair] = entry
+        heappush(self.pq, entry)
+
+    def remove_pair(self, pair):
+        'Mark an existing pair as REMOVED. Ignore if not found.'
+        if pair in self.entry_finder:
+            entry = self.entry_finder[pair]
+            entry[-1] = self.REMOVED
+
+    def adjust_pair_priority(self, pair, adjustment):
+        '''Adjust the priority of a pair by a specified amount. 
+        Use the adjustment as the base priority if not found'''
+        if pair in self.entry_finder:
+            [(priority, _), _, _] = self.entry_finder[pair]
+            self.remove_pair(pair)
+            self.add_pair(pair, -priority + adjustment)
+        else:
+            self.add_pair(pair, adjustment)
     
-    sorted_pairs = sorted(
-        pairs.items(),
-        key=lambda p: (p[1], p[0]), # sort by count first, then break ties lexicographically
-        reverse=True
-    )
-    if len(sorted_pairs) == 0:
-        return ()
-    return sorted_pairs[0][0]
+    def pop_pair(self):
+        'Remove and return the lowest priority pair. Raise KeyError if empty.'
+        while self.pq:
+            _, _, pair = heappop(self.pq)
+            if pair is not self.REMOVED:
+                del self.entry_finder[pair]
+                return pair
+        raise KeyError('pop from an empty priority queue')
 
-def _update_byte_frequencies(
+
+def _get_most_frequent_pair(byte_pair_frequencies):
+    return byte_pair_frequencies.pop_pair()
+    
+
+def _apply_all_merges(
+    words: set[tuple[bytes,...]],
+    pair: tuple[bytes],
+    merged_pair: bytes,
+) -> dict[tuple[bytes, ...], tuple[bytes, ...]]:
+    """Given a set of words where each contains a merged pair, apply
+    all merges, and mapping from new_tokens -> old_tokens where
+    old_tokens is the word pre-merge, and new_tokens is the word with the
+    merge applied.
+    """
+    replacements = {}
+    for old_tokens in words:
+        i, new_tokens = 0, []
+        while i < len(old_tokens):
+            if i < len(old_tokens)-1 and (old_tokens[i], old_tokens[i+1]) == pair:
+                new_tokens.append(merged_pair) 
+                i += 2
+            else:
+                new_tokens.append(old_tokens[i])
+                i += 1
+        new_tokens = tuple(new_tokens)
+        replacements[new_tokens] = old_tokens
+    return replacements
+
+def _update_state(
     most_frequent_pair: tuple[bytes],
     merged_pair: bytes,
     byte_frequencies: dict[tuple[bytes], int],
-) -> dict[tuple[bytes], int]:
-    """Given a pair of byte-sequences that we wish to merge and a frequency table mapping byte-sequences
-    to the number of times they appear in our corpus, returns the updated frequency table after
-    making the merge.
+    byte_pair_frequencies: UpdateHeap,
+    byte_pair_to_words: dict[tuple[bytes, bytes], Counter[tuple[bytes, ...]]],
+) -> tuple[
+    dict[tuple[bytes], int],
+    UpdateHeap,
+    dict[tuple[bytes, bytes], set[tuple[bytes, ...]]],
+]:
+    """Applies a merge to all words containing `most_frequent_pair`, updating and
+    returning byte_frequencies, byte_pair_frequencies, and byte_pair_to_words accordingly.
     """
-    updated_frequencies = {}
-    for bytes, freq in byte_frequencies.items():
-        i, new_bytes = 0, []
-        bytes_length = len(bytes)
-        while i < bytes_length:
-            if i+1 == bytes_length:
-                new_bytes.append(bytes[i])
-                break
-            candidate_pair = (bytes[i], bytes[i+1])
-            if candidate_pair == most_frequent_pair:
-                new_bytes.append(merged_pair)
-                i += 1
-            else:
-                new_bytes.append(candidate_pair[0])
-            i += 1
-        new_bytes = tuple(new_bytes)
-        updated_frequencies[new_bytes] = freq
+    # Obtain a mapping from words with the merges applied to the word that they replace
+    words = byte_pair_to_words[most_frequent_pair]
+    replacements = _apply_all_merges(words, most_frequent_pair, merged_pair)
     
-    return updated_frequencies   
+    # Update byte_frequencies (word counts) with merge applied
+    for new_tokens, old_tokens in replacements.items():
+        byte_frequencies[new_tokens] = byte_frequencies[old_tokens]
+
+    # Update the frequency of each byte_pair based on how many were added/removed by the merges
+    # Also update the set of words to which each pair maps
+    pair_to_adjustment = {}
+    added_pair_to_words = defaultdict(Counter)
+    for new_tokens, old_tokens in replacements.items():
+        old_tokens_pairs_set = set([tuple(pair) for pair in zip(old_tokens[:-1], old_tokens[1:])])
+        new_word_pairs = ([tuple(pair) for pair in zip(new_tokens[:-1], new_tokens[1:])])
+        new_word_pairs_to_counter = Counter(new_word_pairs)
+        new_word_pairs_set = set(new_word_pairs)
+
+        # Calculate adjustments for affected, existing pairs
+        for old_pair in old_tokens_pairs_set:
+            old_pair_words = byte_pair_to_words[old_pair]
+            adjustment = 0
+            if old_tokens in old_pair_words:
+                adjustment += -(byte_frequencies[old_tokens] * old_pair_words[old_tokens])
+                del old_pair_words[old_tokens]
+            if old_pair in new_word_pairs_set:
+                appearances = new_word_pairs_to_counter[old_pair]
+                old_pair_words[new_tokens] = old_pair_words[new_tokens] + appearances
+                adjustment += byte_frequencies[new_tokens] * appearances
+
+            pair_to_adjustment[old_pair] = pair_to_adjustment.get(old_pair, 0) + adjustment
+
+            byte_pair_to_words[old_pair] = old_pair_words  
+
+        # Calculate adjustments for newly created pairs
+        merged_pair_indices = [i for i in range(len(new_tokens)) if new_tokens[i] == merged_pair]
+        added_pairs = set()
+        for index in merged_pair_indices:
+            if index > 0:
+                added_pairs.add((new_tokens[index-1], new_tokens[index]))
+            if index < len(new_tokens)-1:
+                added_pairs.add((new_tokens[index], new_tokens[index+1]))
+        for ap in added_pairs:
+            frequency = new_word_pairs_to_counter[ap]
+            added_pair_to_words[ap][new_tokens] = frequency
+            pair_to_adjustment[ap] = pair_to_adjustment.get(ap, 0) + byte_frequencies[new_tokens] * frequency   
+    
+    byte_pair_to_words.update(added_pair_to_words)
+    for pair, adjustment in pair_to_adjustment.items():
+        if adjustment:
+            byte_pair_frequencies.adjust_pair_priority(pair, adjustment)
+
+    for old_tokens in replacements.values():
+        del byte_frequencies[old_tokens]
+
+    return byte_frequencies, byte_pair_frequencies, byte_pair_to_words
+    
 
 def _create_initial_vocab(
     special_tokens: list[str]
@@ -64,19 +172,19 @@ def _create_initial_vocab(
     itself and the number of initial entries.
     """
     num_special_tokens = len(special_tokens)
-    vocab = {}
     vocab = { 
         index: bytes([index-num_special_tokens])
         for index in range(num_special_tokens, 256+num_special_tokens)
     }
 
-    for i, special_token in enumerate[str](special_tokens):
+    for i, special_token in enumerate(special_tokens):
         vocab[i] = special_token.encode('utf-8')
 
     return vocab, len(vocab)
 
 def _get_chunk_word_frequencies(
-    file_chunk: str,
+    input_path: str,
+    start_end_pair: tuple[int, int],
     regex_pattern: str,
     special_tokens: list[str],
 ) -> Counter[str]:
@@ -85,26 +193,58 @@ def _get_chunk_word_frequencies(
     Call this on separate chunks of a file using dedicated processes to do pre-
     tokenization in parallel
     """
-    file_chunk_split_on_special_characters = re.split(
-        ('|'.join([re.escape(st) for st in special_tokens])),
-        file_chunk,
-    )
-    
-    pre_tokenized_segments: list[re.Scanner] = [
-        re.finditer(regex_pattern, segment) 
-        for segment in file_chunk_split_on_special_characters
-    ]
+    start, end = start_end_pair
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    word_frequencies_per_segment = [
-        Counter([word.group() for word in segment])
-        for segment in tqdm(
-            pre_tokenized_segments, desc="Intra-chunk per-segment word frequency construction")
-    ]
-    return word_frequencies_per_segment
+        file_chunk_split_on_special_characters = re.split(
+            ('|'.join([re.escape(st) for st in special_tokens])),
+            chunk,
+        )
+        
+        pre_tokenized_segments: list[re.Scanner] = [
+            re.finditer(regex_pattern, segment) 
+            for segment in file_chunk_split_on_special_characters
+        ]
+
+        word_frequencies_per_segment = [
+            Counter([word.group() for word in segment])
+            for segment in tqdm(
+                pre_tokenized_segments, desc="Intra-chunk per-segment word frequency construction")
+        ]
+        return word_frequencies_per_segment
+
+def _create_byte_pair_frequencies(
+    word_frequencies: Counter[str]
+) -> tuple[UpdateHeap, dict[tuple[bytes, bytes], Counter[tuple[bytes]]]]:
+    byte_pair_frequencies_dict = {}
+    byte_pair_to_words = {}
+
+    for word in word_frequencies:
+        word_bytes = word.encode('utf-8')
+        count = word_frequencies[word]
+        for pair in zip(word_bytes[:-1], word_bytes[1:]):
+            byte_1, byte_2 = pair
+            # Cast back to bytes since list indexing casts to integers
+            byte_1, byte_2 = byte_1.to_bytes(), byte_2.to_bytes()  
+            byte_pair_frequencies_dict[pair] = byte_pair_frequencies_dict.get(pair, 0) + count
+            byte_pair_words = byte_pair_to_words.get((byte_1, byte_2), Counter())
+            word_bytes_tuple = (tuple([b.to_bytes() for b in word_bytes]))
+            byte_pair_words[word_bytes_tuple] += 1
+            byte_pair_to_words[(byte_1, byte_2)] = byte_pair_words
+
+    byte_pair_frequencies = UpdateHeap([
+        ((b1.to_bytes(), b2.to_bytes()), count) for (b1, b2), count in
+        list(byte_pair_frequencies_dict.items())
+    ])
+
+    return byte_pair_frequencies, byte_pair_to_words
+
 
 
 def _create_byte_frequencies(
-    file: BinaryIO,
+    input_path: str,
     regex_pattern: str,
     special_tokens: list[str],
     num_processes: int,
@@ -113,17 +253,12 @@ def _create_byte_frequencies(
     and a regex pattern, then constructs a mapping from tuples of bytes in the corpus to the 
     frequency at which they appear.
     """
-    boundaries = find_chunk_boundaries(file, num_processes, special_tokens[0].encode('utf-8'))
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, NUM_CORPUS_CHUNKS, special_tokens[0].encode('utf-8'))
 
-    start_end_pairs = zip(boundaries[:-1], boundaries[1:])
-
-    file_chunks = []
-    for start, end in start_end_pairs:
-        file.seek(start)
-        chunk = file.read(end - start).decode("utf-8", errors="ignore")
-        file_chunks.append(chunk)
-
-    num_chunks = len(file_chunks)
+    start_end_pairs = list(zip(boundaries[:-1], boundaries[1:]))
+    num_chunks = len(start_end_pairs)
+    chunk_input_paths =[input_path] * num_chunks
     chunk_regex_patterns = [regex_pattern] * num_chunks
     chunk_special_tokens = [special_tokens] * num_chunks
 
@@ -132,7 +267,8 @@ def _create_byte_frequencies(
         word_frequencies_per_segment_per_chunk = list(
             executor.map(
                 _get_chunk_word_frequencies,
-                file_chunks,
+                chunk_input_paths,
+                start_end_pairs,
                 chunk_regex_patterns,
                 chunk_special_tokens,
             )
@@ -157,7 +293,9 @@ def _create_byte_frequencies(
         for word in tqdm(word_frequencies, desc="Byte frequency construction")
     }
 
-    return byte_frequencies
+    byte_pair_frequencies, byte_pair_to_words = _create_byte_pair_frequencies(word_frequencies)
+
+    return byte_frequencies, byte_pair_frequencies, byte_pair_to_words
 
 
 def train_bpe(
@@ -166,41 +304,43 @@ def train_bpe(
     special_tokens: list[str]=['<|endoftext|>']
 ) -> tuple[dict[int, bytes], list[tuple[tuple[bytes]]]]:
     vocab, initial_vocab_size = _create_initial_vocab(special_tokens)
-    with open(input_path, "rb") as file:
 
-        byte_frequencies: dict[tuple[bytes], int] = _create_byte_frequencies(
-            file=file,
-            regex_pattern=PAT,
-            special_tokens=special_tokens,
-            num_processes=cpu_count(),
-        )
+    byte_frequencies, byte_pair_frequencies, byte_pair_to_words = _create_byte_frequencies(
+        input_path=input_path,
+        regex_pattern=PAT,
+        special_tokens=special_tokens,
+        num_processes=NUM_PROCESSES,
+    )
 
-        merges = []
-        num_merges = len(merges)
+    merges = []
+    num_merges = len(merges)
 
-        progress_bar = tqdm(total=vocab_size, desc=f"Merges (out of expected {vocab_size})")
+    progress_bar = tqdm(total=vocab_size, desc=f"Merges (out of expected {vocab_size})")
 
-        while True:
-            most_frequent_pair = _get_most_frequent_pair(byte_frequencies)
-            if len(most_frequent_pair) == 0:
-                break
-            
-            merges.append(most_frequent_pair)
-            merged_pair = most_frequent_pair[0] + most_frequent_pair[1]
-            vocab[initial_vocab_size + num_merges] = merged_pair
+    while True:
+        most_frequent_pair = _get_most_frequent_pair(byte_pair_frequencies)
 
-            num_merges += 1
-            
-            byte_frequencies = _update_byte_frequencies(
-                most_frequent_pair=most_frequent_pair,
-                merged_pair=merged_pair,
-                byte_frequencies=byte_frequencies,
-            )
-            if len(vocab) == vocab_size:
-                break
-
-            progress_bar.update()
+        if len(most_frequent_pair) == 0:
+            break
         
-        progress_bar.close()
+        merges.append(most_frequent_pair)
+        merged_pair = most_frequent_pair[0] + most_frequent_pair[1]
+        vocab[initial_vocab_size + num_merges] = merged_pair
 
-        return (vocab, merges)
+        num_merges += 1
+        
+        byte_frequencies, byte_pair_frequencies, byte_pair_to_words = _update_state(
+            most_frequent_pair=most_frequent_pair,
+            byte_frequencies=byte_frequencies,
+            merged_pair=merged_pair,
+            byte_pair_frequencies=byte_pair_frequencies,
+            byte_pair_to_words=byte_pair_to_words,
+        )
+        if len(vocab) == vocab_size:
+            break
+
+        progress_bar.update()
+    
+    progress_bar.close()
+
+    return (vocab, merges)
