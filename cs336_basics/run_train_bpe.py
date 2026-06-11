@@ -1,7 +1,7 @@
 import json
 from tests.common import gpt2_bytes_to_unicode
-from tokenizer import train_bpe
-from datetime import datetime, time, date
+from bpe import train_bpe
+from datetime import datetime
 
 def print_time(start_time, end_time) -> None:
     total_seconds = int((end_time - start_time).total_seconds())
