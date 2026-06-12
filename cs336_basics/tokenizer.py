@@ -1,4 +1,9 @@
-from typing import Iterable, Iterator
+import json
+import regex as re
+from typing import Iterable, Iterator, Self
+
+from cs336_basics.common import PAT
+from tests.common import gpt2_bytes_to_unicode
 
 
 class Tokenizer():
@@ -8,7 +13,9 @@ class Tokenizer():
         merges: list[tuple[bytes, bytes]],
         special_tokens: list[str] | None = None,    
     ):
-        pass
+        self.vocab: dict[int, bytes] = vocab
+        self.merges: list[tuple[bytes, bytes]] = merges
+        self.special_tokens: list[str] | None = special_tokens
 
     @classmethod
     def from_files(
@@ -16,11 +23,74 @@ class Tokenizer():
         vocab_filepath: str,
         merges_filepath: str,
         special_tokens: list[str] | None = None,
-    ):
-        pass
+    ) -> Self:
+        gpt2_byte_decoder = { v:k for k, v in gpt2_bytes_to_unicode().items() }
+        with open(vocab_filepath, 'r') as v, open(merges_filepath, 'r') as m:
+            raw_vocab = json.load(v)
+            vocab = {
+                index: bytes([gpt2_byte_decoder[token] for token in vocab_item])
+                for vocab_item, index in raw_vocab.items()
+            }
+            for special_token in special_tokens:
+                byte_encoded_special_token = special_token.encode('utf-8')
+                if byte_encoded_special_token not in set(vocab.values()):
+                    vocab[len(vocab)] = byte_encoded_special_token
+
+            text_merges = [tuple(line.rstrip().split(" ")) for line in m]
+            gpt2_byte_decoder = {v: k for k, v in gpt2_bytes_to_unicode().items()}
+            merges = [
+                (
+                    bytes([gpt2_byte_decoder[token] for token in merge_token_1]),
+                    bytes([gpt2_byte_decoder[token] for token in merge_token_2]),
+                )
+                for merge_token_1, merge_token_2 in text_merges
+            ]
+        
+        return Tokenizer(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
-        pass
+        encoding = []
+        vocab_item_to_index = { v:k for k,v in self.vocab.items() }
+
+        text_split_on_special_characters = re.split(
+            ('|'.join([re.escape(st) for st in self.special_tokens]) if self.special_tokens else ''),
+            text,
+        )
+
+        pre_tokenized_segments: list[re.Scanner] = [
+            re.finditer(PAT, segment) 
+            for segment in text_split_on_special_characters
+        ]
+
+
+        merge_priorities = { merge : i for i, merge in enumerate(self.merges)}
+
+        for segment in pre_tokenized_segments:
+            for pre_token in segment:
+                pre_token_bytes = pre_token.group().encode('utf-8', errors='replace')
+                tokens = [b.to_bytes() for b in pre_token_bytes]
+                while True:
+                    min_merge, min_priority = None, float('inf')
+                    for pair in zip(tokens[:-1], tokens[1:]):
+                        if pair in merge_priorities and merge_priorities[pair] < min_priority:
+                            min_merge = pair
+                            min_priority = merge_priorities[pair]
+                    
+                    if min_merge is None:
+                        break
+
+                    i = 0
+                    merged = min_merge[0] + min_merge[1]
+                    while i < len(tokens)-1:
+                        if (tokens[i], tokens[i+1]) == min_merge:
+                            tokens = tokens[:i] + [merged] + tokens[i+2:]
+                            i += 1
+                        i += 1                   
+
+                for token in tokens:
+                    encoding.append(vocab_item_to_index[token])
+        
+        return encoding
 
     def encode_iterable(
         self,
