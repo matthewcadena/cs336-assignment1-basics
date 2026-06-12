@@ -1,7 +1,6 @@
 import json
 import regex as re
 from typing import Iterable, Iterator, Self
-
 from cs336_basics.common import PAT
 from tests.common import gpt2_bytes_to_unicode
 
@@ -15,7 +14,25 @@ class Tokenizer():
     ):
         self.vocab: dict[int, bytes] = vocab
         self.merges: list[tuple[bytes, bytes]] = merges
-        self.special_tokens: list[str] | None = special_tokens
+
+        # split on longest special_token first to avoid splitting on 
+        # overlapping delimiters
+        special_tokens = [] if special_tokens is None else sorted(
+            special_tokens,
+            key=lambda x: len(x),
+            reverse=True,
+        )
+
+        self.special_tokens: list[str] = special_tokens
+
+        for special_token in self.special_tokens:
+                byte_encoded_special_token = special_token.encode('utf-8')
+                if byte_encoded_special_token not in set(vocab.values()):
+                    self.vocab[len(self.vocab)] = byte_encoded_special_token
+
+        self.vocab_item_to_index = { v:k for k,v in self.vocab.items() }
+        self.merge_priorities =  { merge : i for i, merge in enumerate(self.merges)}
+
 
     @classmethod
     def from_files(
@@ -31,6 +48,7 @@ class Tokenizer():
                 index: bytes([gpt2_byte_decoder[token] for token in vocab_item])
                 for vocab_item, index in raw_vocab.items()
             }
+            special_tokens = [] if special_tokens is None else special_tokens
             for special_token in special_tokens:
                 byte_encoded_special_token = special_token.encode('utf-8')
                 if byte_encoded_special_token not in set(vocab.values()):
@@ -50,31 +68,34 @@ class Tokenizer():
 
     def encode(self, text: str) -> list[int]:
         encoding = []
-        vocab_item_to_index = { v:k for k,v in self.vocab.items() }
 
         text_split_on_special_characters = re.split(
-            ('|'.join([re.escape(st) for st in self.special_tokens]) if self.special_tokens else ''),
+            (rf'({'|'.join([re.escape(st) for st in self.special_tokens])})'),
             text,
-        )
+        ) if self.special_tokens else [text]
 
-        pre_tokenized_segments: list[re.Scanner] = [
-            re.finditer(PAT, segment) 
-            for segment in text_split_on_special_characters
-        ]
+        pre_tokenized_segments = []
+        for segment in text_split_on_special_characters:
+            if segment in self.special_tokens:
+                # append special token bytes without pre-tokenizing them 
+                pre_tokenized_segments.append(segment.encode('utf-8', errors='replace'))
+            else:
+                pre_tokenized_segments.append(re.finditer(PAT, segment))
 
-
-        merge_priorities = { merge : i for i, merge in enumerate(self.merges)}
 
         for segment in pre_tokenized_segments:
+            if isinstance(segment, bytes):
+                encoding.append(self.vocab_item_to_index[segment])
+                continue
             for pre_token in segment:
                 pre_token_bytes = pre_token.group().encode('utf-8', errors='replace')
                 tokens = [b.to_bytes() for b in pre_token_bytes]
                 while True:
                     min_merge, min_priority = None, float('inf')
                     for pair in zip(tokens[:-1], tokens[1:]):
-                        if pair in merge_priorities and merge_priorities[pair] < min_priority:
+                        if pair in self.merge_priorities and self.merge_priorities[pair] < min_priority:
                             min_merge = pair
-                            min_priority = merge_priorities[pair]
+                            min_priority = self.merge_priorities[pair]
                     
                     if min_merge is None:
                         break
@@ -88,7 +109,7 @@ class Tokenizer():
                         i += 1                   
 
                 for token in tokens:
-                    encoding.append(vocab_item_to_index[token])
+                    encoding.append(self.vocab_item_to_index[token])
         
         return encoding
 
@@ -96,10 +117,10 @@ class Tokenizer():
         self,
         iterable: Iterable[str],
     ) -> Iterator[int]:
-        pass
+        return (id for line in iterable for id in self.encode(line))
 
     def decode(
         self,
         ids: list[int],
     ) -> str:
-        pass
+        return b''.join([self.vocab[id] for id in ids]).decode('utf-8', errors='replace')
